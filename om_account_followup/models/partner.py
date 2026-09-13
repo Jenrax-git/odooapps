@@ -1,8 +1,10 @@
 from functools import reduce
 from lxml import etree
+from datetime import datetime
 from odoo import api, fields, models, _
 from odoo.exceptions import ValidationError
 from odoo.tools.misc import formatLang
+from markupsafe import Markup
 
 
 class ResPartner(models.Model):
@@ -22,7 +24,7 @@ class ResPartner(models.Model):
         return res
 
     def _get_latest(self):
-        company = self.env.user.company_id
+        company = self.env.company
         for partner in self:
             amls = partner.unreconciled_aml_ids
             latest_date = False
@@ -149,7 +151,7 @@ class ResPartner(models.Model):
         partner = self.commercial_partner_id
         followup_table = ''
         if partner.unreconciled_aml_ids:
-            company = self.env.user.company_id
+            company = self.env.company
             current_date = fields.Date.today()
             report = self.env['report.om_account_followup.report_followup']
             final_res = report._lines_get_with_partner(partner, company.id)
@@ -176,6 +178,7 @@ class ResPartner(models.Model):
                     strbegin = "<TD>"
                     strend = "</TD>"
                     date = aml['date_maturity'] or aml['date']
+                    date = datetime.strptime(date, "%d/%m/%Y").date()
                     if date <= current_date and aml['balance'] > 0:
                         strbegin = "<TD><B>"
                         strend = "</B></TD>"
@@ -195,7 +198,7 @@ class ResPartner(models.Model):
                                 </table>
                                 <center>''' + _(
                     "Amount due") + ''' : %s </center>''' % (total)
-        return followup_table
+        return Markup(followup_table)
 
     def write(self, vals):
         if vals.get("payment_responsible_id", False):
@@ -223,7 +226,7 @@ class ResPartner(models.Model):
 
     def do_button_print(self):
         self.ensure_one()
-        company_id = self.env.user.company_id.id
+        company_id = self.env.company.id
         if not self.env['account.move.line'].search(
                 [('partner_id', '=', self.id),
                  ('account_id.account_type', '=', 'asset_receivable'),
@@ -250,7 +253,7 @@ class ResPartner(models.Model):
         return self.do_partner_print(wizard_partner_ids, data)
 
     def _get_amounts_and_date(self):
-        company = self.env.user.company_id
+        company = self.env.company
         current_date = fields.Date.today()
         for partner in self:
             worst_due_date = False
@@ -268,30 +271,47 @@ class ResPartner(models.Model):
             partner.payment_earliest_due_date = worst_due_date
 
     def _get_followup_overdue_query(self, args, overdue_only=False):
-        company_id = self.env.user.company_id.id
-        having_where_clause = ' AND '.join(
-            map(lambda x: '(SUM(bal2) %s %%s)' % (x[1]), args))
-        having_values = [x[2] for x in args]
-        having_where_clause = having_where_clause % (having_values[0])
-        overdue_only_str = overdue_only and 'AND date_maturity <= NOW()' or ''
-        return ('''SELECT pid AS partner_id, SUM(bal2) FROM
-                                    (SELECT CASE WHEN bal IS NOT NULL THEN bal
-                                    ELSE 0.0 END AS bal2, p.id as pid FROM
-                                    (SELECT (debit-credit) AS bal, partner_id
-                                    FROM account_move_line l
-                                    LEFT JOIN account_account a ON a.id = l.account_id
-                                    WHERE a.account_type = 'asset_receivable'
-                                    %s AND full_reconcile_id IS NULL
-                                    AND l.company_id = %s) AS l
-                                    RIGHT JOIN res_partner p
-                                    ON p.id = partner_id ) AS pl
-                                    GROUP BY pid HAVING %s''') % (
-            overdue_only_str, company_id, having_where_clause)
+        company_id = self.env.company.id
+        having_clauses = []
+        having_values = []
+
+        for field, operator, value in args:
+            if operator in ['=', '!=', '>', '>=', '<', '<=']:
+                having_clauses.append(f'SUM(bal2) {operator} %s')
+                having_values.append(value)
+            else:
+                raise ValueError(f"Unsupported operator: {operator}")
+
+        having_where_clause = ' AND '.join(having_clauses)
+        overdue_only_str = 'AND date_maturity <= NOW()' if overdue_only else ''
+
+        query = ('''
+            SELECT pid AS partner_id, SUM(bal2) FROM (
+                SELECT 
+                    CASE WHEN bal IS NOT NULL THEN bal ELSE 0.0 END AS bal2, 
+                    p.id as pid 
+                FROM (
+                    SELECT 
+                        (debit - credit) AS bal, 
+                        partner_id 
+                    FROM account_move_line l
+                    LEFT JOIN account_account a ON a.id = l.account_id
+                    WHERE a.account_type = 'asset_receivable'
+                    %s AND full_reconcile_id IS NULL
+                    AND l.company_id = %%s
+                ) AS l
+                RIGHT JOIN res_partner p ON p.id = partner_id 
+            ) AS pl
+            GROUP BY pid HAVING %s
+        ''') % (overdue_only_str, having_where_clause)
+
+        params = [company_id] + having_values
+        return query, params
 
     def _payment_overdue_search(self, operator, operand):
         args = [('payment_amount_overdue', operator, operand)]
-        query = self._get_followup_overdue_query(args, overdue_only=True)
-        self._cr.execute(query)
+        query, params = self._get_followup_overdue_query(args, overdue_only=True)
+        self._cr.execute(query, params)
         res = self._cr.fetchall()
         if not res:
             return [('id', '=', '0')]
@@ -299,7 +319,7 @@ class ResPartner(models.Model):
 
     def _payment_earliest_date_search(self, operator, operand):
         args = [('payment_earliest_due_date', operator, operand)]
-        company_id = self.env.user.company_id.id
+        company_id = self.env.company.id
         having_where_clause = ' AND '.join(
             map(lambda x: "(MIN(l.date_maturity) %s '%%s')" % (x[1]), args))
         having_values = [x[2] for x in args]
@@ -310,7 +330,7 @@ class ResPartner(models.Model):
                 AND l.company_id = %s 
                 AND l.full_reconcile_id IS NULL 
                 AND partner_id IS NOT NULL GROUP BY partner_id"""
-        query = query % (company_id)
+        query = query % company_id
         if having_where_clause:
             query += ' HAVING %s ' % (having_where_clause)
         self._cr.execute(query)
@@ -321,8 +341,8 @@ class ResPartner(models.Model):
 
     def _payment_due_search(self, operator, operand):
         args = [('payment_amount_due', operator, operand)]
-        query = self._get_followup_overdue_query(args, overdue_only=False)
-        self._cr.execute(query)
+        query, params = self._get_followup_overdue_query(args, overdue_only=False)
+        self._cr.execute(query, params)
         res = self._cr.fetchall()
         if not res:
             return [('id', '=', '0')]
@@ -373,7 +393,7 @@ class ResPartner(models.Model):
         help="Gives the sequence order when displaying a list of follow-up lines.", default=0
     )
     latest_followup_level_id_without_lit = fields.Many2one(
-        'followup.line', compute='_get_latest', store=True, compute_sudo=True,
+        'followup.line', compute='_get_latest', compute_sudo=True,
         string="Latest Follow-up Level without litigation",
         help="The maximum follow-up level without taking into "
              "account the account move lines with litigation")
